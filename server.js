@@ -134,6 +134,44 @@ function findTune(db, tuneId) {
   return tune;
 }
 
+const ISSUE_PRIORITIES = ["high", "medium", "low"];
+
+// 历史问题缺少优先级（或值非法）一律按中优先级处理
+function issuePriority(issue) {
+  return ISSUE_PRIORITIES.includes(issue.priority) ? issue.priority : "medium";
+}
+
+function decorateIssue(issue) {
+  return { ...issue, priority: issuePriority(issue) };
+}
+
+// 区段上的未解决高优先级问题会阻止校对
+function blockingIssues(db, sectionId) {
+  return db.issues.filter(
+    (item) => item.sectionId === sectionId && item.status !== "resolved" && issuePriority(item) === "high"
+  );
+}
+
+// 区段查询附带未解决问题数量（含低优先级）与阻止标记
+function decorateSection(db, section) {
+  const open = db.issues.filter((item) => item.sectionId === section.id && item.status !== "resolved");
+  const openHigh = open.filter((item) => issuePriority(item) === "high");
+  return {
+    ...section,
+    openIssueCount: open.length,
+    openHighPriorityCount: openHigh.length,
+    blocked: openHigh.length > 0
+  };
+}
+
+// 已校对区段出现未解决的高优先级问题时回退为未校对，曲目进度随已校对数同步下降
+function revertSectionIfBlocked(db, section) {
+  if (section && section.checked && blockingIssues(db, section.id).length) {
+    section.checked = false;
+  }
+  return section;
+}
+
 function buildProgress(db, tuneId) {
   findTune(db, tuneId);
   const sections = db.sections.filter((item) => item.tuneId === tuneId);
@@ -183,7 +221,8 @@ async function handle(req, res) {
   if (tuneSectionsMatch && req.method === "GET") {
     const tuneId = tuneSectionsMatch[1];
     findTune(db, tuneId);
-    return send(res, 200, { data: db.sections.filter((item) => item.tuneId === tuneId) });
+    const sections = db.sections.filter((item) => item.tuneId === tuneId).map((section) => decorateSection(db, section));
+    return send(res, 200, { data: sections });
   }
 
   if (tuneSectionsMatch && req.method === "POST") {
@@ -209,7 +248,10 @@ async function handle(req, res) {
   if (uncheckedMatch && req.method === "GET") {
     const tuneId = uncheckedMatch[1];
     findTune(db, tuneId);
-    return send(res, 200, { data: db.sections.filter((item) => item.tuneId === tuneId && !item.checked) });
+    const sections = db.sections
+      .filter((item) => item.tuneId === tuneId && !item.checked)
+      .map((section) => decorateSection(db, section));
+    return send(res, 200, { data: sections });
   }
 
   const progressMatch = pathname.match(/^\/tunes\/([^/]+)\/progress$/);
@@ -222,16 +264,34 @@ async function handle(req, res) {
     const section = db.sections.find((item) => item.id === checkMatch[1]);
     if (!section) return send(res, 404, { error: "区间不存在" });
     const body = await parseBody(req);
-    section.checked = body.checked !== undefined ? Boolean(body.checked) : true;
+    const checked = body.checked !== undefined ? Boolean(body.checked) : true;
+    if (checked) {
+      const blocking = blockingIssues(db, section.id);
+      if (blocking.length) {
+        return send(res, 409, {
+          error: `区段还有 ${blocking.length} 个未解决的高优先级问题，无法标记为已校对`,
+          blockingIssueIds: blocking.map((item) => item.id)
+        });
+      }
+    }
+    section.checked = checked;
     section.note = body.note ?? section.note;
     await writeDb(db);
-    return send(res, 200, { data: section });
+    return send(res, 200, { data: decorateSection(db, section) });
   }
 
   if (req.method === "GET" && pathname === "/issues") {
     const tuneId = searchParams.get("tuneId");
     const status = searchParams.get("status");
-    const issues = db.issues.filter((item) => (!tuneId || item.tuneId === tuneId) && (!status || item.status === status));
+    const priority = searchParams.get("priority");
+    const issues = db.issues
+      .filter(
+        (item) =>
+          (!tuneId || item.tuneId === tuneId) &&
+          (!status || item.status === status) &&
+          (!priority || issuePriority(item) === priority)
+      )
+      .map(decorateIssue);
     return send(res, 200, { data: issues });
   }
 
@@ -241,6 +301,10 @@ async function handle(req, res) {
     findTune(db, body.tuneId);
     const section = db.sections.find((item) => item.id === body.sectionId && item.tuneId === body.tuneId);
     if (!section) return send(res, 400, { error: "区间不存在或不属于该曲目" });
+    const priority = body.priority === undefined ? "medium" : body.priority;
+    if (!ISSUE_PRIORITIES.includes(priority)) {
+      return send(res, 400, { error: `优先级必须是：${ISSUE_PRIORITIES.join(", ")}` });
+    }
     const issue = {
       id: makeId("issue"),
       tuneId: body.tuneId,
@@ -249,13 +313,15 @@ async function handle(req, res) {
       beat: body.beat === undefined ? null : Number(body.beat),
       lane: body.lane === undefined ? null : Number(body.lane),
       description: body.description,
+      priority,
       status: "open",
       createdAt: new Date().toISOString(),
       resolvedAt: null
     };
     db.issues.push(issue);
+    revertSectionIfBlocked(db, section);
     await writeDb(db);
-    return send(res, 201, { data: issue });
+    return send(res, 201, { data: issue, section: decorateSection(db, section) });
   }
 
   const issueStatusMatch = pathname.match(/^\/issues\/([^/]+)\/status$/);
@@ -267,8 +333,11 @@ async function handle(req, res) {
     issue.status = body.status;
     issue.resolvedAt = body.status === "resolved" ? new Date().toISOString() : null;
     issue.note = body.note ?? issue.note;
+    // 解决只解除阻止，不代替人工确认；重新打开高优先级问题则回退已校对区段
+    const section = db.sections.find((item) => item.id === issue.sectionId);
+    if (issue.status !== "resolved") revertSectionIfBlocked(db, section);
     await writeDb(db);
-    return send(res, 200, { data: issue });
+    return send(res, 200, { data: decorateIssue(issue), section: section ? decorateSection(db, section) : null });
   }
 
   return send(res, 404, { error: "接口不存在", routes });
