@@ -5,6 +5,17 @@ const path = require("path");
 const PORT = Number(process.env.PORT || 3019);
 const DB_FILE = path.join(__dirname, "data", "db.json");
 
+const PRIORITIES = ["high", "medium", "low"];
+
+// 新增问题默认中优先级；历史问题缺少优先级（或值非法）也按中处理
+function issuePriority(issue) {
+  return PRIORITIES.includes(issue.priority) ? issue.priority : "medium";
+}
+
+function isOpenIssue(issue) {
+  return issue.status !== "resolved";
+}
+
 const initialData = {
   tunes: [
     {
@@ -134,18 +145,48 @@ function findTune(db, tuneId) {
   return tune;
 }
 
+function sectionIssueStats(db, sectionId) {
+  const issues = db.issues.filter((item) => item.sectionId === sectionId);
+  const open = issues.filter(isOpenIssue);
+  const openHigh = open.filter((item) => issuePriority(item) === "high").length;
+  return {
+    openIssues: open.length,
+    openHighIssues: openHigh,
+    resolvedIssues: issues.length - open.length,
+    blockedByHighIssue: openHigh > 0
+  };
+}
+
+// 区段查询需附带未解决问题数量（低优先级也计入）
+function decorateSection(db, section) {
+  return { ...section, ...sectionIssueStats(db, section.id) };
+}
+
+// 存在未解决高优先级问题的区段不允许保持“已校对”
+function applyHighIssueGate(db, section) {
+  if (!section) return false;
+  const stats = sectionIssueStats(db, section.id);
+  if (section.checked && stats.blockedByHighIssue) {
+    section.checked = false;
+    return true;
+  }
+  return false;
+}
+
 function buildProgress(db, tuneId) {
   findTune(db, tuneId);
   const sections = db.sections.filter((item) => item.tuneId === tuneId);
   const issues = db.issues.filter((item) => item.tuneId === tuneId);
   const checkedCount = sections.filter((item) => item.checked).length;
-  const openIssues = issues.filter((item) => item.status !== "resolved").length;
+  const openIssues = issues.filter(isOpenIssue).length;
+  const openHighIssues = issues.filter((item) => isOpenIssue(item) && issuePriority(item) === "high").length;
   return {
     tuneId,
     totalSections: sections.length,
     checkedSections: checkedCount,
     uncheckedSections: sections.length - checkedCount,
     openIssues,
+    openHighIssues,
     resolvedIssues: issues.length - openIssues,
     percent: sections.length ? Math.round((checkedCount / sections.length) * 100) : 0
   };
@@ -183,7 +224,10 @@ async function handle(req, res) {
   if (tuneSectionsMatch && req.method === "GET") {
     const tuneId = tuneSectionsMatch[1];
     findTune(db, tuneId);
-    return send(res, 200, { data: db.sections.filter((item) => item.tuneId === tuneId) });
+    const data = db.sections
+      .filter((item) => item.tuneId === tuneId)
+      .map((section) => decorateSection(db, section));
+    return send(res, 200, { data });
   }
 
   if (tuneSectionsMatch && req.method === "POST") {
@@ -202,14 +246,17 @@ async function handle(req, res) {
     };
     db.sections.push(section);
     await writeDb(db);
-    return send(res, 201, { data: section });
+    return send(res, 201, { data: decorateSection(db, section) });
   }
 
   const uncheckedMatch = pathname.match(/^\/tunes\/([^/]+)\/unchecked-sections$/);
   if (uncheckedMatch && req.method === "GET") {
     const tuneId = uncheckedMatch[1];
     findTune(db, tuneId);
-    return send(res, 200, { data: db.sections.filter((item) => item.tuneId === tuneId && !item.checked) });
+    const data = db.sections
+      .filter((item) => item.tuneId === tuneId && !item.checked)
+      .map((section) => decorateSection(db, section));
+    return send(res, 200, { data });
   }
 
   const progressMatch = pathname.match(/^\/tunes\/([^/]+)\/progress$/);
@@ -222,16 +269,32 @@ async function handle(req, res) {
     const section = db.sections.find((item) => item.id === checkMatch[1]);
     if (!section) return send(res, 404, { error: "区间不存在" });
     const body = await parseBody(req);
-    section.checked = body.checked !== undefined ? Boolean(body.checked) : true;
+    const nextChecked = body.checked !== undefined ? Boolean(body.checked) : true;
+    // 未解决的高优先级问题会阻止区段校对；撤销校对不受限
+    if (nextChecked && sectionIssueStats(db, section.id).blockedByHighIssue) {
+      return send(res, 409, {
+        error: "该区段仍有未解决的高优先级问题，无法校对",
+        data: decorateSection(db, section)
+      });
+    }
+    section.checked = nextChecked;
     section.note = body.note ?? section.note;
     await writeDb(db);
-    return send(res, 200, { data: section });
+    return send(res, 200, { data: decorateSection(db, section) });
   }
 
   if (req.method === "GET" && pathname === "/issues") {
     const tuneId = searchParams.get("tuneId");
     const status = searchParams.get("status");
-    const issues = db.issues.filter((item) => (!tuneId || item.tuneId === tuneId) && (!status || item.status === status));
+    const priority = searchParams.get("priority");
+    const issues = db.issues
+      .filter(
+        (item) =>
+          (!tuneId || item.tuneId === tuneId) &&
+          (!status || item.status === status) &&
+          (!priority || issuePriority(item) === priority)
+      )
+      .map((issue) => ({ ...issue, priority: issuePriority(issue) }));
     return send(res, 200, { data: issues });
   }
 
@@ -241,6 +304,10 @@ async function handle(req, res) {
     findTune(db, body.tuneId);
     const section = db.sections.find((item) => item.id === body.sectionId && item.tuneId === body.tuneId);
     if (!section) return send(res, 400, { error: "区间不存在或不属于该曲目" });
+    const priority = body.priority === undefined ? "medium" : body.priority;
+    if (!PRIORITIES.includes(priority)) {
+      return send(res, 400, { error: `优先级非法，可选：${PRIORITIES.join(", ")}` });
+    }
     const issue = {
       id: makeId("issue"),
       tuneId: body.tuneId,
@@ -249,13 +316,20 @@ async function handle(req, res) {
       beat: body.beat === undefined ? null : Number(body.beat),
       lane: body.lane === undefined ? null : Number(body.lane),
       description: body.description,
+      priority,
       status: "open",
       createdAt: new Date().toISOString(),
       resolvedAt: null
     };
     db.issues.push(issue);
+    // 已校对区段新增高优先级问题后回退为未校对，曲目进度随之下跌
+    const reverted = applyHighIssueGate(db, section);
     await writeDb(db);
-    return send(res, 201, { data: issue });
+    return send(res, 201, {
+      data: issue,
+      section: decorateSection(db, section),
+      revertedChecked: reverted
+    });
   }
 
   const issueStatusMatch = pathname.match(/^\/issues\/([^/]+)\/status$/);
@@ -267,8 +341,24 @@ async function handle(req, res) {
     issue.status = body.status;
     issue.resolvedAt = body.status === "resolved" ? new Date().toISOString() : null;
     issue.note = body.note ?? issue.note;
+    // 历史问题缺少优先级时按中处理，可在此显式补录
+    if (body.priority !== undefined) {
+      if (!PRIORITIES.includes(body.priority)) {
+        return send(res, 400, { error: `优先级非法，可选：${PRIORITIES.join(", ")}` });
+      }
+      issue.priority = body.priority;
+    } else {
+      issue.priority = issuePriority(issue);
+    }
+    const section = db.sections.find((item) => item.id === issue.sectionId) || null;
+    // 重新打开高优先级问题同样回退校对；解决最后一个高优先级问题只解除阻止，不自动校对
+    const reverted = applyHighIssueGate(db, section);
     await writeDb(db);
-    return send(res, 200, { data: issue });
+    return send(res, 200, {
+      data: issue,
+      section: section ? decorateSection(db, section) : null,
+      revertedChecked: reverted
+    });
   }
 
   return send(res, 404, { error: "接口不存在", routes });
